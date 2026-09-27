@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -110,67 +111,40 @@ func listPosts(pool *pgxpool.Pool) http.HandlerFunc {
 				return
 			}
 
-			// append adds p to the end of the list and gives back the
-			// updated list, which we store back in posts.
 			posts = append(posts, p)
 		}
 
-		// The loop above stops on "no more rows" OR on an error partway
-		// through (like a dropped connection). rows.Err() tells us which.
 		if err := rows.Err(); err != nil {
 			log.Printf("list posts rows failed: %v", err)
 			writeError(w, http.StatusInternalServerError, "something went wrong")
 			return
 		}
 
-		// Everything worked: send the list as JSON with status 200 (OK).
 		writeJSON(w, http.StatusOK, posts)
 	}
 }
 
-// getPost answers GET /posts/{id} with one full post.
-// Same closure pattern as listPosts.
 func getPost(pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// r.PathValue("id") gets whatever filled the {id} placeholder, as
-		// text. strconv.ParseInt turns it into a number:
-		//   10 = base 10 (normal decimal numbers)
-		//   64 = fit it into an int64
-		// If the text isn't a number (like /posts/hello), err is not nil.
-		// "||" means "or": we also reject 0 and negative numbers, since
-		// database ids start at 1.
+
 		id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 		if err != nil || id < 1 {
-			// 400 Bad Request: the visitor asked for something malformed.
 			writeError(w, http.StatusBadRequest, "invalid post id")
 			return
 		}
 
 		var p Post
 
-		// QueryRow is for queries that return (at most) one row.
-		// $1 is a placeholder that pgx fills in with the id we pass after
-		// the SQL. NEVER paste values directly into SQL text: placeholders
-		// keep the value separate from the query, which is what prevents
-		// "SQL injection" attacks.
-		//
-		// The trailing dot on the "id)." line lets us continue with .Scan on
-		// the next line. Go requires the dot at the END of the line when you
-		// split a chain like this.
 		err = pool.QueryRow(r.Context(), `
 			SELECT id, title, category, to_char(published_on, 'YYYY-MM-DD'), body
 			FROM posts
 			WHERE id = $1`, id).
 			Scan(&p.ID, &p.Title, &p.Category, &p.PublishedOn, &p.Body)
 
-		// errors.Is checks whether err is (or wraps) the specific
-		// "no rows found" error from pgx. That's not a server failure; it
-		// just means no post has this id, so we answer 404 Not Found.
 		if errors.Is(err, pgx.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "post not found")
 			return
 		}
-		// Any OTHER error is a real problem (database down, etc.).
 		if err != nil {
 			log.Printf("get post query failed: %v", err)
 			writeError(w, http.StatusInternalServerError, "something went wrong")
@@ -181,81 +155,44 @@ func getPost(pool *pgxpool.Pool) http.HandlerFunc {
 	}
 }
 
-// =============================================================================
-// MIDDLEWARE — code that runs around every request
-// =============================================================================
-
-// withCORS wraps the router so every response gets CORS headers.
-//
-// WHY THIS EXISTS: browsers block a web page from reading responses from a
-// different domain unless that domain explicitly allows it. Your frontend
-// (e.g. yourblog.com) and API (e.g. api.yourblog.com, or localhost:8080
-// while developing) count as different. These headers are the API saying
-// "I allow that site to read my responses".
-//
-// "next http.Handler" is the thing being wrapped (our router). This pattern
-// (a function that takes a handler and returns a new handler that does
-// something extra, then calls the original) is called "middleware".
-func withCORS(allowedOrigin string, next http.Handler) http.Handler {
-	// http.HandlerFunc(...) turns a plain function into an http.Handler.
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if allowedOrigin != "" {
-			// w.Header().Set adds a header to the response.
-			// Allow-Origin: which site may read responses.
-			w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
-			// Allow-Methods: which request types that site may use.
-			w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-			// Vary: Origin tells caches the response depends on which site
-			// asked, so a cached copy isn't wrongly reused for another site.
-			w.Header().Set("Vary", "Origin")
+func withCORS(allowedOrigins string, next http.Handler) http.Handler {
+	// Turn "a,b" into a set of allowed addresses.
+	allowed := map[string]bool{}
+	for _, o := range strings.Split(allowedOrigins, ",") {
+		o = strings.TrimSpace(o)
+		if o != "" {
+			allowed[o] = true
 		}
+	}
 
-		// Before some requests, browsers send an OPTIONS "preflight" request
-		// to ask permission. We answer with 204 (No Content, meaning "OK,
-		// nothing else to say") and stop, since the headers above are the
-		// whole answer.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Only answer with the address that asked, if it's on the list.
+		origin := r.Header.Get("Origin")
+		if allowed[origin] {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		}
+		w.Header().Set("Vary", "Origin")
+
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-
-		// For every normal request, hand it on to the router.
 		next.ServeHTTP(w, r)
 	})
 }
 
-// =============================================================================
-// HELPERS — small functions used by the handlers above
-// =============================================================================
-
-// writeJSON sends any data as a JSON response with the given status code.
-//
-// "data any" means data can be ANY type: a list of posts, one post, a map.
-// "status int" is the HTTP status code, e.g. 200 OK, 404 Not Found.
-// Names like http.StatusOK are just readable names for those numbers.
 func writeJSON(w http.ResponseWriter, status int, data any) {
-	// Tell the browser the body is JSON.
 	w.Header().Set("Content-Type", "application/json")
 
-	// Send the status code. Headers must be set BEFORE this line; once the
-	// status is written, headers can no longer change.
 	w.WriteHeader(status)
 
-	// json.NewEncoder(w) creates a JSON writer that writes straight into the
-	// response. Encode(data) converts data to JSON text and sends it,
-	// using the struct tags to name the fields.
 	if err := json.NewEncoder(w).Encode(data); err != nil {
-		// The status was already sent, so we can't send an error response
-		// now. The best we can do is log it.
+
 		log.Printf("could not write response: %v", err)
 	}
 }
 
-// writeError sends an error in a consistent JSON shape, like:
-//
-//	{"error":"post not found"}
-//
-// so your frontend can always look for an "error" field.
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
